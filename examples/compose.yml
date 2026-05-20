@@ -1,0 +1,24 @@
+services:
+  docker-cron:
+    build: ..
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Budapest
+      DISCOVERY_INTERVAL_SECONDS: "60"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  whoami:
+    image: traefik/whoami
+    labels:
+      cron.help.schedule: "* * * * *"
+      cron.help.jitterSeconds: "10"
+      cron.help.command: "/whoami --help"
+
+  shell-demo:
+    image: alpine:3.20
+    command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
+    labels:
+      cron.echo.schedule: "* * * * *"
+      cron.echo.jitterSeconds: "10"
+      cron.echo.command: "echo hello-from-shell-demo"
