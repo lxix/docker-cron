@@ -41,7 +41,12 @@ def main() -> int:
     if not result.wasSuccessful():
         return 1
 
-    executable = set(trace._find_executable_linenos(str(TARGET))) - ignored_lines(TARGET)
+    line_count = len(TARGET.read_text(encoding="utf-8").splitlines())
+    executable = {
+        line_number
+        for line_number in trace._find_executable_linenos(str(TARGET))
+        if 1 <= line_number <= line_count
+    } - ignored_lines(TARGET)
     counts = tracer.results().counts
     executed = {
         line_number
