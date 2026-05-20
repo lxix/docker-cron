@@ -78,7 +78,7 @@ services:
       OUTPUT_LIMIT_BYTES: "4096"
       LOG_JOB_OUTPUT: "true"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 ```
 
 Build locally:
@@ -86,6 +86,17 @@ Build locally:
 ```sh
 docker build -t docker-cron:latest .
 ```
+
+## Development
+
+Run the test suite with the project's coverage gate:
+
+```sh
+python3 tools/check_coverage.py
+```
+
+This uses only Python's standard library and enforces 100% line coverage for
+`docker_cron.py`.
 
 ## Behavior
 
@@ -133,8 +144,11 @@ Environment variables:
 ## Security
 
 Mounting `/var/run/docker.sock` grants the controller root-equivalent control
-over the Docker host. Treat container labels as a trusted control plane: any
-actor that can create or change `cron.*` labels can make the controller execute
-commands inside those containers. Only run this on trusted hosts, with trusted
-compose files or deploy manifests, and avoid using it across isolation
-boundaries where untrusted users can create containers.
+over the Docker host, even when the bind mount uses `:ro`. The read-only bind
+mount protects the socket path from filesystem writes inside the controller
+container, but it does not make the Docker Engine API read-only. Treat container
+labels as a trusted control plane: any actor that can create or change `cron.*`
+labels can make the controller execute commands inside those containers. Only
+run this on trusted hosts, with trusted compose files or deploy manifests, and
+avoid using it across isolation boundaries where untrusted users can create
+containers.

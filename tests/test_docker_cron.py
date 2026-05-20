@@ -596,7 +596,7 @@ class DockerCronTests(unittest.TestCase):
 
         self.assertEqual(controller.jobs, {})
 
-    def test_due_jobs_marks_only_matching_jobs_once(self):
+    def test_due_jobs_returns_only_unstarted_matching_jobs_without_marking(self):
         docker = mock.Mock()
         docker.list_running_containers.return_value = []
         controller = DockerCron(
@@ -617,7 +617,8 @@ class DockerCronTests(unittest.TestCase):
         )
 
         self.assertEqual(jobs, [due])
-        self.assertEqual(controller.last_run["due"], "2026-05-20T09:00:00+00:00")
+        self.assertNotIn("due", controller.last_run)
+        self.assertEqual(controller.last_run["duplicate"], "2026-05-20T09:00:00+00:00")
 
     def test_reserve_job_slot_blocks_overlap_and_concurrency(self):
         controller = DockerCron(
@@ -820,6 +821,7 @@ class DockerCronTests(unittest.TestCase):
         self.assertEqual(len(FakeThread.created), 1)
         self.assertEqual(FakeThread.created[0].name, "job-tick")
         self.assertTrue(FakeThread.created[0].started)
+        self.assertIn(job.key, controller.last_run)
 
     def test_schedule_loop_skips_when_job_slot_is_unavailable(self):
         controller = DockerCron(
@@ -837,6 +839,8 @@ class DockerCronTests(unittest.TestCase):
             controller._schedule_loop()
 
         thread_class.assert_not_called()
+        self.assertNotIn(job.key, controller.last_run)
+        self.assertEqual(controller.stop_event.waited, [1.0])
 
     def test_run_job_success_nonzero_stopped_and_error_paths(self):
         class FakeDocker:

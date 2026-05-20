@@ -758,10 +758,13 @@ class DockerCron:
             now = dt.datetime.now(self.timezone).replace(second=0, microsecond=0)
             minute_key = now.isoformat()
             due_jobs = self._due_jobs(now, minute_key)
+            skipped_due_job = False
 
             for job in due_jobs:
                 if not self._reserve_job_slot(job):
+                    skipped_due_job = True
                     continue
+                self._mark_job_run(job, minute_key)
                 thread = threading.Thread(
                     target=self._run_job_thread,
                     args=(job, minute_key),
@@ -772,6 +775,8 @@ class DockerCron:
 
             next_minute = now + dt.timedelta(minutes=1)
             sleep_for = max(0.1, (next_minute - dt.datetime.now(self.timezone)).total_seconds())
+            if skipped_due_job:
+                sleep_for = min(1.0, sleep_for)
             self.stop_event.wait(sleep_for)
 
     def _due_jobs(self, now: dt.datetime, minute_key: str) -> list[Job]:
@@ -783,9 +788,12 @@ class DockerCron:
                     continue
                 if not job.schedule.matches(now):
                     continue
-                self.last_run[job.key] = minute_key
                 due_jobs.append(job)
             return due_jobs
+
+    def _mark_job_run(self, job: Job, minute_key: str) -> None:
+        with self.lock:
+            self.last_run[job.key] = minute_key
 
     def _reserve_job_slot(self, job: Job) -> bool:
         with self.lock:
