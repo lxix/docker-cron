@@ -117,6 +117,25 @@ class FakeLoopEvent:
         self.clear_called = True
 
 
+class RecordingEvent:
+    def __init__(self, wait_results=None):
+        self.wait_results = list(wait_results or [])
+        self.waited = []
+        self.flag = False
+
+    def is_set(self):
+        return self.flag
+
+    def wait(self, timeout=None):
+        self.waited.append(timeout)
+        if self.wait_results:
+            return self.wait_results.pop(0)
+        return False
+
+    def set(self):
+        self.flag = True
+
+
 class CronExpressionTests(unittest.TestCase):
     def test_every_minute_matches(self):
         cron = CronExpression.parse("* * * * *")
@@ -362,6 +381,24 @@ class DockerOutputTests(unittest.TestCase):
             output = dc.read_exec_output(TimeoutResponse(), timeout_seconds=1, output_limit_bytes=3)
 
         self.assertEqual(output, ExecOutput(b"", truncated=False, timed_out=True))
+
+    def test_read_exec_output_handles_timed_out_file_object(self):
+        class TimedOutFileResponse:
+            def read(self, _size):
+                raise OSError("cannot read from timed out object")
+
+        with mock.patch.object(dc.time, "monotonic", side_effect=[0, 0, 2]):
+            output = dc.read_exec_output(TimedOutFileResponse(), timeout_seconds=1, output_limit_bytes=3)
+
+        self.assertEqual(output, ExecOutput(b"", truncated=False, timed_out=True))
+
+    def test_read_exec_output_reraises_unexpected_os_errors(self):
+        class BrokenResponse:
+            def read(self, _size):
+                raise OSError("broken pipe")
+
+        with self.assertRaises(OSError):
+            dc.read_exec_output(BrokenResponse(), timeout_seconds=1, output_limit_bytes=3)
 
 
 class DockerHttpTests(unittest.TestCase):
@@ -870,6 +907,205 @@ class DockerCronTests(unittest.TestCase):
         with mock.patch.object(dc.random, "randint", return_value=5), quiet_logs():
             interrupted._run_job(make_job(jitter_seconds=5), "minute")
 
+    def test_run_job_waits_for_timed_out_exec_in_calling_thread(self):
+        class FakeDocker:
+            def __init__(self):
+                self.inspect_results = [
+                    {"Running": True, "ExitCode": None},
+                    {"Running": True, "ExitCode": None},
+                    {"Running": False, "ExitCode": 124},
+                ]
+
+            def container_is_running(self, container_id):
+                return True
+
+            def create_exec(self, container_id, argv):
+                return "exec-timeout"
+
+            def start_exec(self, exec_id, *, timeout_seconds, output_limit_bytes):
+                return ExecOutput(b"slow", truncated=False, timed_out=True)
+
+            def inspect_exec(self, exec_id):
+                return self.inspect_results.pop(0)
+
+        controller = DockerCron(
+            docker=FakeDocker(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        controller.stop_event = RecordingEvent()
+
+        with quiet_logs():
+            controller._run_job(make_job(), "minute")
+
+        self.assertEqual(controller.stop_event.waited, [dc.EXEC_TIMEOUT_POLL_INTERVAL_SECONDS])
+
+    def test_run_job_thread_keeps_slot_until_timed_out_exec_finishes(self):
+        class BlockingEvent:
+            def __init__(self):
+                self.flag = False
+                self.entered_wait = dc.threading.Event()
+                self.release_wait = dc.threading.Event()
+                self.waited = []
+
+            def is_set(self):
+                return self.flag
+
+            def wait(self, timeout=None):
+                self.waited.append(timeout)
+                self.entered_wait.set()
+                self.release_wait.wait(1)
+                return False
+
+            def set(self):
+                self.flag = True
+                self.release_wait.set()
+
+        class FakeDocker:
+            def __init__(self):
+                self.inspect_results = [
+                    {"Running": True, "ExitCode": None},
+                    {"Running": True, "ExitCode": None},
+                    {"Running": False, "ExitCode": 124},
+                ]
+
+            def container_is_running(self, container_id):
+                return True
+
+            def create_exec(self, container_id, argv):
+                return "exec-timeout"
+
+            def start_exec(self, exec_id, *, timeout_seconds, output_limit_bytes):
+                return ExecOutput(b"slow", truncated=False, timed_out=True)
+
+            def inspect_exec(self, exec_id):
+                return self.inspect_results.pop(0)
+
+        controller = DockerCron(
+            docker=FakeDocker(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        controller.stop_event = BlockingEvent()
+        job = make_job()
+        self.assertTrue(controller._reserve_job_slot(job))
+
+        with quiet_logs():
+            thread = dc.threading.Thread(target=controller._run_job_thread, args=(job, "minute"))
+            thread.start()
+            self.assertTrue(controller.stop_event.entered_wait.wait(1))
+            self.assertIn(job.key, controller.active_jobs)
+            self.assertFalse(controller._reserve_job_slot(job))
+            controller.stop_event.release_wait.set()
+            thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(controller.active_jobs, set())
+        self.assertEqual(controller.stop_event.waited, [dc.EXEC_TIMEOUT_POLL_INTERVAL_SECONDS])
+
+    def test_wait_for_timed_out_exec_handles_missing_exec(self):
+        class FakeDocker:
+            def inspect_exec(self, exec_id):
+                raise DockerError(404, b"missing")
+
+        controller = DockerCron(
+            docker=FakeDocker(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+
+        with quiet_logs():
+            controller._wait_for_timed_out_exec(make_job(), "missing-exec")
+
+    def test_wait_for_timed_out_exec_retries_inspect_errors(self):
+        class FakeDocker:
+            def __init__(self):
+                self.results = [
+                    DockerError(500, b"broken"),
+                    {"Running": False, "ExitCode": 1},
+                ]
+
+            def inspect_exec(self, exec_id):
+                result = self.results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return result
+
+        controller = DockerCron(
+            docker=FakeDocker(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        controller.stop_event = RecordingEvent()
+
+        with quiet_logs():
+            controller._wait_for_timed_out_exec(make_job(), "flaky-exec")
+
+        self.assertEqual(controller.stop_event.waited, [dc.EXEC_TIMEOUT_POLL_INTERVAL_SECONDS])
+
+    def test_wait_for_timed_out_exec_stops_after_inspect_error_when_requested(self):
+        class FakeDocker:
+            def inspect_exec(self, exec_id):
+                raise DockerError(500, b"broken")
+
+        controller = DockerCron(
+            docker=FakeDocker(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        controller.stop_event = RecordingEvent(wait_results=[True])
+
+        with quiet_logs():
+            controller._wait_for_timed_out_exec(make_job(), "broken-exec")
+
+        self.assertEqual(controller.stop_event.waited, [dc.EXEC_TIMEOUT_POLL_INTERVAL_SECONDS])
+
+    def test_wait_for_timed_out_exec_returns_when_container_stops(self):
+        class FakeDocker:
+            def inspect_exec(self, exec_id):
+                return {"Running": True, "ExitCode": None}
+
+            def container_is_running(self, container_id):
+                return False
+
+        controller = DockerCron(
+            docker=FakeDocker(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+
+        with quiet_logs():
+            controller._wait_for_timed_out_exec(make_job(), "orphaned-exec")
+
+        self.assertTrue(controller.rescan_event.is_set())
+
+    def test_wait_for_timed_out_exec_returns_when_stop_is_requested(self):
+        class FakeDocker:
+            def inspect_exec(self, exec_id):
+                return {"Running": True, "ExitCode": None}
+
+            def container_is_running(self, container_id):
+                return True
+
+        controller = DockerCron(
+            docker=FakeDocker(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        controller.stop_event = RecordingEvent(wait_results=[True])
+
+        with quiet_logs():
+            controller._wait_for_timed_out_exec(make_job(), "stopping-exec")
+
+        self.assertEqual(controller.stop_event.waited, [dc.EXEC_TIMEOUT_POLL_INTERVAL_SECONDS])
+
     def test_execute_job_command_shell_direct_and_error_modes(self):
         class FakeDocker:
             def __init__(self, create_effects, start_payloads=None, inspect_results=None):
@@ -902,7 +1138,8 @@ class DockerCronTests(unittest.TestCase):
             discovery_interval_seconds=60,
             self_container_id=None,
         )
-        output, exec_info, mode = shell_controller._execute_job_command(job)
+        exec_id, output, exec_info, mode = shell_controller._execute_job_command(job)
+        self.assertEqual(exec_id, "shell-exec")
         self.assertEqual((output, exec_info, mode), (ExecOutput(b"payload", False, False), {"ExitCode": 0}, "shell"))
 
         missing_shell = DockerError(500, b'exec: "/bin/sh": stat /bin/sh: no such file or directory')
@@ -914,7 +1151,8 @@ class DockerCronTests(unittest.TestCase):
             self_container_id=None,
         )
         with quiet_logs():
-            output, exec_info, mode = direct_controller._execute_job_command(job)
+            exec_id, output, exec_info, mode = direct_controller._execute_job_command(job)
+        self.assertEqual(exec_id, "direct-exec")
         self.assertEqual(mode, "direct")
         self.assertEqual(direct_docker.argvs[1], ["/whoami", "--name", "cron probe"])
 
@@ -933,7 +1171,8 @@ class DockerCronTests(unittest.TestCase):
             self_container_id=None,
         )
         with quiet_logs():
-            output, exec_info, mode = start_failure_controller._execute_job_command(job)
+            exec_id, output, exec_info, mode = start_failure_controller._execute_job_command(job)
+        self.assertEqual(exec_id, "direct-exec")
         self.assertEqual((output, exec_info, mode), (ExecOutput(b"direct payload", False, False), {"ExitCode": 0}, "direct"))
         self.assertEqual(start_failure_docker.argvs[1], ["/whoami", "--name", "cron probe"])
 
@@ -943,7 +1182,8 @@ class DockerCronTests(unittest.TestCase):
             discovery_interval_seconds=60,
             self_container_id=None,
         )
-        output, exec_info, mode = timeout_controller._execute_job_command(job)
+        exec_id, output, exec_info, mode = timeout_controller._execute_job_command(job)
+        self.assertEqual(exec_id, "shell-exec")
         self.assertEqual((output, exec_info, mode), (ExecOutput(b"slow", False, True), {"ExitCode": 0}, "shell"))
 
         non_missing = DockerError(500, b"permission denied")

@@ -42,6 +42,7 @@ DEFAULT_MAX_JITTER_SECONDS = 3600
 DEFAULT_OUTPUT_LIMIT_BYTES = 4096
 EXEC_READ_CHUNK_BYTES = 8192
 EXEC_READ_IDLE_TIMEOUT_SECONDS = 1.0
+EXEC_TIMEOUT_POLL_INTERVAL_SECONDS = 5.0
 USE_DEFAULT_TIMEOUT = object()
 
 
@@ -598,6 +599,10 @@ def read_exec_output(
             chunk = read_chunk(EXEC_READ_CHUNK_BYTES)
         except (TimeoutError, socket.timeout):
             continue
+        except OSError as error:
+            if "cannot read from timed out object" not in str(error):
+                raise
+            continue
 
         if not chunk:
             return ExecOutput(bytes(payload), truncated, False)
@@ -849,11 +854,12 @@ class DockerCron:
                 self.rescan_event.set()
                 return
 
-            output, exec_info, exec_mode = self._execute_job_command(job)
+            exec_id, output, exec_info, exec_mode = self._execute_job_command(job)
             exit_code = exec_info.get("ExitCode")
             log_fields = {
                 "container": job.container_name,
                 "job": job.name,
+                "execId": exec_id,
                 "exitCode": exit_code,
                 "execMode": exec_mode,
                 "timedOut": output.timed_out,
@@ -865,9 +871,11 @@ class DockerCron:
 
             log(
                 "info" if exit_code == 0 and not output.timed_out else "error",
-                "job finished",
+                "job timed out" if output.timed_out else "job finished",
                 **log_fields,
             )
+            if output.timed_out:
+                self._wait_for_timed_out_exec(job, exec_id)
         except Exception as error:
             log(
                 "error",
@@ -878,15 +886,74 @@ class DockerCron:
             )
             self.rescan_event.set()
 
-    def _execute_job_command(self, job: Job) -> tuple[ExecOutput, dict[str, Any], str]:
+    def _wait_for_timed_out_exec(self, job: Job, exec_id: str) -> None:
+        log(
+            "warning",
+            "waiting for timed-out exec to finish before releasing job slot",
+            container=job.container_name,
+            job=job.name,
+            execId=exec_id,
+        )
+
+        while not self.stop_event.is_set():
+            try:
+                exec_info = self.docker.inspect_exec(exec_id)
+            except DockerError as error:
+                if error.status == 404:
+                    log(
+                        "warning",
+                        "timed-out exec disappeared before completion could be confirmed",
+                        container=job.container_name,
+                        job=job.name,
+                        execId=exec_id,
+                    )
+                    return
+                log(
+                    "warning",
+                    "failed to inspect timed-out exec",
+                    container=job.container_name,
+                    job=job.name,
+                    execId=exec_id,
+                    error=str(error),
+                )
+                if self.stop_event.wait(EXEC_TIMEOUT_POLL_INTERVAL_SECONDS):
+                    return
+                continue
+
+            if not exec_info.get("Running"):
+                log(
+                    "info",
+                    "timed-out exec finished",
+                    container=job.container_name,
+                    job=job.name,
+                    execId=exec_id,
+                    exitCode=exec_info.get("ExitCode"),
+                )
+                return
+
+            if not self.docker.container_is_running(job.container_id):
+                log(
+                    "warning",
+                    "target container stopped while waiting for timed-out exec",
+                    container=job.container_name,
+                    job=job.name,
+                    execId=exec_id,
+                )
+                self.rescan_event.set()
+                return
+
+            if self.stop_event.wait(EXEC_TIMEOUT_POLL_INTERVAL_SECONDS):
+                return
+
+    def _execute_job_command(self, job: Job) -> tuple[str, ExecOutput, dict[str, Any], str]:
         try:
-            output, exec_info = self._execute_argv(job, ["/bin/sh", "-lc", job.command])
+            exec_id, output, exec_info = self._execute_argv(job, ["/bin/sh", "-lc", job.command])
         except DockerError as error:
             if not is_missing_shell_error(error):
                 raise
         else:
             if output.timed_out or not is_missing_shell_exec_result(output.payload, exec_info):
-                return output, exec_info, "shell"
+                return exec_id, output, exec_info, "shell"
 
         argv = parse_direct_command(job.command)
         log(
@@ -898,7 +965,7 @@ class DockerCron:
         )
         return (*self._execute_argv(job, argv), "direct")
 
-    def _execute_argv(self, job: Job, argv: list[str]) -> tuple[ExecOutput, dict[str, Any]]:
+    def _execute_argv(self, job: Job, argv: list[str]) -> tuple[str, ExecOutput, dict[str, Any]]:
         exec_id = self.docker.create_exec(job.container_id, argv)
         output = self.docker.start_exec(
             exec_id,
@@ -906,7 +973,7 @@ class DockerCron:
             output_limit_bytes=self.output_limit_bytes,
         )
         exec_info = self.docker.inspect_exec(exec_id)
-        return output, exec_info
+        return exec_id, output, exec_info
 
     def _is_self(self, container_id: str) -> bool:
         if not self.self_container_id:

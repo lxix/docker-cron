@@ -96,8 +96,10 @@ docker build -t docker-cron:latest .
   `DISCOVERY_INTERVAL_SECONDS`.
 - Jobs do not overlap with a previous still-running execution of the same job.
 - The controller enforces a global `MAX_CONCURRENT_JOBS` limit.
-- A job that exceeds its timeout is logged as timed out and the controller
-  worker is released. Use command-level timeouts too when hard process
+- A job that exceeds its timeout is logged as timed out. The controller keeps
+  that job slot reserved until Docker reports that the exec process has
+  finished, or the target container stops, so timed-out jobs do not pile up with
+  overlapping retries. Use command-level timeouts too when hard process
   cancellation matters.
 - Job output is captured up to `OUTPUT_LIMIT_BYTES` and marked as truncated when
   the command writes more. Set `LOG_JOB_OUTPUT=false` to omit stdout/stderr from
