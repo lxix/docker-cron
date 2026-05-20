@@ -87,21 +87,6 @@ Build locally:
 docker build -t docker-cron:latest .
 ```
 
-## Release image
-
-Images are published to GitHub Container Registry when a GitHub release is
-published or a version tag is pushed:
-
-```sh
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-The release workflow publishes these tags:
-
-- `ghcr.io/lxix/docker-cron:latest`
-- `ghcr.io/lxix/docker-cron:1.0.0`
-
 ## Behavior
 
 - On startup, the controller scans all currently running containers.
