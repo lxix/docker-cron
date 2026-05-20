@@ -152,3 +152,11 @@ labels can make the controller execute commands inside those containers. Only
 run this on trusted hosts, with trusted compose files or deploy manifests, and
 avoid using it across isolation boundaries where untrusted users can create
 containers.
+
+## Alternatives
+
+### Ofelia
+
+Use [`mcuadros/ofelia`](https://github.com/mcuadros/ofelia) when you need a
+broader Docker scheduler with extra job types, INI configuration, remote
+Docker options, or built-in reporting integrations.
