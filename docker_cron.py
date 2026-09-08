@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """Label-driven Docker cron controller.
 
-The controller watches running containers on the local Docker host and executes
-commands inside containers that expose labels with the form:
-
-    cron.<jobname>.schedule
-    cron.<jobname>.command
-    cron.<jobname>.jitterSeconds
-
-It intentionally uses only Python's standard library and the Docker Engine HTTP
-API over the mounted Unix socket. No Docker CLI or external scheduler is needed.
+The label contract and the runtime behavior are documented in README.md, the
+design decisions behind them in docs/decisions.md.
 """
 
 from __future__ import annotations
@@ -41,8 +34,9 @@ DEFAULT_MAX_CONCURRENT_JOBS = 10
 DEFAULT_MAX_JITTER_SECONDS = 3600
 DEFAULT_OUTPUT_LIMIT_BYTES = 4096
 EXEC_READ_CHUNK_BYTES = 8192
-EXEC_READ_IDLE_TIMEOUT_SECONDS = 1.0
 EXEC_TIMEOUT_POLL_INTERVAL_SECONDS = 5.0
+JOB_SLOT_WAIT_SECONDS = 60.0
+JOB_SLOT_POLL_INTERVAL_SECONDS = 0.5
 USE_DEFAULT_TIMEOUT = object()
 
 
@@ -313,7 +307,10 @@ class DockerClient:
             self.timeout_seconds if timeout is USE_DEFAULT_TIMEOUT else timeout,
         )
         conn.request(method, path, body=payload, headers=headers)
-        return conn.getresponse()
+        sock = conn.sock
+        response = conn.getresponse()
+        response.docker_socket = sock
+        return response
 
     def list_running_containers(self) -> list[dict[str, Any]]:
         return self.request("GET", "/containers/json?all=0")
@@ -356,12 +353,10 @@ class DockerClient:
         output_limit_bytes: int,
     ) -> ExecOutput:
         encoded = urllib.parse.quote(exec_id, safe="")
-        read_timeout = min(timeout_seconds, EXEC_READ_IDLE_TIMEOUT_SECONDS)
         response = self.stream(
             "POST",
             f"/exec/{encoded}/start",
             body={"Detach": False, "Tty": False},
-            timeout=read_timeout,
         )
         try:
             return read_exec_output(response, timeout_seconds, output_limit_bytes)
@@ -537,8 +532,8 @@ def container_name(container: dict[str, Any]) -> str:
     return str(container.get("Id", ""))[:12]
 
 
-def decode_exec_output(payload: bytes) -> tuple[str, str]:
-    if not looks_like_multiplexed_exec_output(payload):
+def decode_exec_output(payload: bytes, truncated: bool = False) -> tuple[str, str]:
+    if not looks_like_multiplexed_exec_output(payload, truncated):
         return payload.decode("utf-8", errors="replace").strip(), ""
 
     stdout: list[bytes] = []
@@ -569,7 +564,7 @@ def decode_exec_output(payload: bytes) -> tuple[str, str]:
     )
 
 
-def looks_like_multiplexed_exec_output(payload: bytes) -> bool:
+def looks_like_multiplexed_exec_output(payload: bytes, truncated: bool = False) -> bool:
     if len(payload) < 8:
         return False
     stream_type = payload[0]
@@ -577,8 +572,24 @@ def looks_like_multiplexed_exec_output(payload: bytes) -> bool:
         return False
     if payload[1:4] != b"\x00\x00\x00":
         return False
+    if truncated:
+        # A payload cut off at the output limit ends mid frame, so the declared
+        # frame size cannot be used to confirm the framing.
+        return True
     size = struct.unpack(">I", payload[4:8])[0]
     return size <= len(payload) - 8
+
+
+def arm_stream_read_timeout(response: Any, timeout_seconds: float) -> None:
+    """Re-arm the response socket so the next read wakes up at the deadline.
+
+    Reading with a short, fixed socket timeout is not an option: CPython marks a
+    socket file object as permanently timed out after its first timeout, so every
+    later read fails immediately instead of returning the command output.
+    """
+    sock = getattr(response, "docker_socket", None)
+    if sock is not None:
+        sock.settimeout(timeout_seconds)
 
 
 def read_exec_output(
@@ -592,17 +603,19 @@ def read_exec_output(
     read_chunk = getattr(response, "read1", response.read)
 
     while True:
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return ExecOutput(bytes(payload), truncated, True)
 
+        arm_stream_read_timeout(response, remaining)
         try:
             chunk = read_chunk(EXEC_READ_CHUNK_BYTES)
         except (TimeoutError, socket.timeout):
-            continue
+            return ExecOutput(bytes(payload), truncated, True)
         except OSError as error:
             if "cannot read from timed out object" not in str(error):
                 raise
-            continue
+            return ExecOutput(bytes(payload), truncated, True)
 
         if not chunk:
             return ExecOutput(bytes(payload), truncated, False)
@@ -757,14 +770,11 @@ class DockerCron:
         while not self.stop_event.is_set():
             now = dt.datetime.now(self.timezone).replace(second=0, microsecond=0)
             minute_key = now.isoformat()
-            due_jobs = self._due_jobs(now, minute_key)
-            skipped_due_job = False
 
-            for job in due_jobs:
-                if not self._reserve_job_slot(job):
-                    skipped_due_job = True
-                    continue
+            for job in self._due_jobs(now, minute_key):
                 self._mark_job_run(job, minute_key)
+                if not self._reserve_job(job):
+                    continue
                 thread = threading.Thread(
                     target=self._run_job_thread,
                     args=(job, minute_key),
@@ -775,8 +785,6 @@ class DockerCron:
 
             next_minute = now + dt.timedelta(minutes=1)
             sleep_for = max(0.1, (next_minute - dt.datetime.now(self.timezone)).total_seconds())
-            if skipped_due_job:
-                sleep_for = min(1.0, sleep_for)
             self.stop_event.wait(sleep_for)
 
     def _due_jobs(self, now: dt.datetime, minute_key: str) -> list[Job]:
@@ -795,7 +803,7 @@ class DockerCron:
         with self.lock:
             self.last_run[job.key] = minute_key
 
-    def _reserve_job_slot(self, job: Job) -> bool:
+    def _reserve_job(self, job: Job) -> bool:
         with self.lock:
             if job.key in self.active_jobs:
                 log(
@@ -805,7 +813,19 @@ class DockerCron:
                     job=job.name,
                 )
                 return False
-            if not self.job_slots.acquire(blocking=False):
+            self.active_jobs.add(job.key)
+            return True
+
+    def _release_job(self, job: Job) -> None:
+        with self.lock:
+            self.active_jobs.remove(job.key)
+
+    def _acquire_execution_slot(self, job: Job) -> bool:
+        deadline = time.monotonic() + JOB_SLOT_WAIT_SECONDS
+        while not self.stop_event.is_set():
+            if self.job_slots.acquire(blocking=False):
+                return True
+            if time.monotonic() >= deadline:
                 log(
                     "warning",
                     "skipping job because max concurrent jobs is reached",
@@ -814,34 +834,37 @@ class DockerCron:
                     maxConcurrentJobs=self.max_concurrent_jobs,
                 )
                 return False
-            self.active_jobs.add(job.key)
-            return True
+            self.stop_event.wait(JOB_SLOT_POLL_INTERVAL_SECONDS)
+        return False
 
-    def _release_job_slot(self, job: Job) -> None:
-        with self.lock:
-            self.active_jobs.remove(job.key)
-            self.job_slots.release()
+    def _wait_for_jitter(self, job: Job, minute_key: str) -> bool:
+        if job.jitter_seconds <= 0:
+            return True
+        delay = random.randint(0, job.jitter_seconds)
+        log(
+            "info",
+            "waiting before job execution",
+            container=job.container_name,
+            job=job.name,
+            scheduledMinute=minute_key,
+            delaySeconds=delay,
+        )
+        return not self.stop_event.wait(delay)
 
     def _run_job_thread(self, job: Job, minute_key: str) -> None:
         try:
-            self._run_job(job, minute_key)
+            if not self._wait_for_jitter(job, minute_key):
+                return
+            if not self._acquire_execution_slot(job):
+                return
+            try:
+                self._run_job(job, minute_key)
+            finally:
+                self.job_slots.release()
         finally:
-            self._release_job_slot(job)
+            self._release_job(job)
 
     def _run_job(self, job: Job, minute_key: str) -> None:
-        if job.jitter_seconds > 0:
-            delay = random.randint(0, job.jitter_seconds)
-            log(
-                "info",
-                "waiting before job execution",
-                container=job.container_name,
-                job=job.name,
-                scheduledMinute=minute_key,
-                delaySeconds=delay,
-            )
-            if self.stop_event.wait(delay):
-                return
-
         log(
             "info",
             "starting job",
@@ -874,7 +897,7 @@ class DockerCron:
                 "outputTruncated": output.truncated,
             }
             if self.log_job_output:
-                stdout, stderr = decode_exec_output(output.payload)
+                stdout, stderr = decode_exec_output(output.payload, output.truncated)
                 log_fields.update(stdout=stdout, stderr=stderr)
 
             log(

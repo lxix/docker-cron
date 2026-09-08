@@ -1,10 +1,14 @@
 import contextlib
 import datetime as dt
+import http.client
 import io
 import json
 import os
 import signal
+import socket
 import struct
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -18,6 +22,7 @@ from docker_cron import (
     ExecOutput,
     Job,
     UnixHTTPConnection,
+    arm_stream_read_timeout,
     container_name,
     decode_exec_output,
     is_missing_shell_error,
@@ -368,6 +373,20 @@ class DockerOutputTests(unittest.TestCase):
         self.assertFalse(looks_like_multiplexed_exec_output(b"\x01bad\x00\x00\x00\x00"))
         self.assertFalse(looks_like_multiplexed_exec_output(b"\x01\x00\x00\x00\x00\x00\x00\x02x"))
 
+    def test_truncated_multiplexed_output_keeps_its_framing(self):
+        """A payload cut at the output limit must not leak raw frame headers."""
+        full = b"\x01\x00\x00\x00\x00\x00\x00\x14" + b"x" * 20
+        payload = full[:16]
+
+        self.assertFalse(looks_like_multiplexed_exec_output(payload))
+        self.assertIn("\x01", decode_exec_output(payload)[0])
+
+        self.assertTrue(looks_like_multiplexed_exec_output(payload, True))
+        self.assertEqual(decode_exec_output(payload, True), ("xxxxxxxx", ""))
+
+    def test_truncated_untagged_output_is_still_decoded_as_raw_text(self):
+        self.assertEqual(decode_exec_output(b"plain text out", True), ("plain text out", ""))
+
     def test_read_exec_output_limits_output(self):
         output = dc.read_exec_output(FakeResponse(body=b"abcdef"), timeout_seconds=10, output_limit_bytes=3)
         self.assertEqual(output, ExecOutput(b"abc", truncated=True, timed_out=False))
@@ -392,6 +411,18 @@ class DockerOutputTests(unittest.TestCase):
 
         self.assertEqual(output, ExecOutput(b"", truncated=False, timed_out=True))
 
+    def test_read_exec_output_stops_once_the_deadline_passes_between_reads(self):
+        """Output that keeps arriving past the deadline is kept, then reported."""
+
+        class SlowResponse:
+            def read(self, _size):
+                time.sleep(0.3)
+                return b"chunk"
+
+        output = dc.read_exec_output(SlowResponse(), timeout_seconds=0.2, output_limit_bytes=64)
+
+        self.assertEqual(output, ExecOutput(b"chunk", truncated=False, timed_out=True))
+
     def test_read_exec_output_reraises_unexpected_os_errors(self):
         class BrokenResponse:
             def read(self, _size):
@@ -399,6 +430,119 @@ class DockerOutputTests(unittest.TestCase):
 
         with self.assertRaises(OSError):
             dc.read_exec_output(BrokenResponse(), timeout_seconds=1, output_limit_bytes=3)
+
+
+@contextlib.contextmanager
+def exec_stream(script, initial_timeout):
+    """Serve a scripted Docker exec stream over a real socket.
+
+    `script` is a list of `(delay_seconds, payload)` steps. `initial_timeout` is
+    the socket timeout the response starts with, standing in for the Docker API
+    request timeout that the connection was opened with.
+    """
+    server, client = socket.socketpair()
+    finished = threading.Event()
+
+    def serve():
+        try:
+            server.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/vnd.docker.raw-stream\r\n\r\n"
+            )
+            for delay, chunk in script:
+                if finished.wait(delay):
+                    return
+                server.sendall(chunk)
+        except OSError:  # pragma: no cover - only on abrupt client teardown
+            pass
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    client.settimeout(initial_timeout)
+    response = http.client.HTTPResponse(client)
+    response.begin()
+    response.docker_socket = client
+
+    reads = []
+    inner_read1 = response.read1
+
+    def counting_read1(size):
+        reads.append(size)
+        return inner_read1(size)
+
+    response.read1 = counting_read1
+    response.read_attempts = reads
+
+    try:
+        yield response
+    finally:
+        finished.set()
+        response.close()
+        client.close()
+        thread.join(2)
+
+
+class ExecStreamReadTests(unittest.TestCase):
+    """Regression tests that drive read_exec_output over a real socket."""
+
+    def test_silence_longer_than_the_socket_timeout_still_returns_output(self):
+        frame = b"\x01\x00\x00\x00\x00\x00\x00\x05hello"
+        with exec_stream([(0.8, frame)], initial_timeout=0.2) as response:
+            started = time.monotonic()
+            output = dc.read_exec_output(response, timeout_seconds=10, output_limit_bytes=4096)
+            elapsed = time.monotonic() - started
+
+        self.assertFalse(output.timed_out)
+        self.assertFalse(output.truncated)
+        self.assertEqual(decode_exec_output(output.payload), ("hello", ""))
+        # It returned when the command finished, not when the deadline expired.
+        self.assertLess(elapsed, 5)
+        # And it waited on the socket instead of spinning on read errors.
+        self.assertLess(len(response.read_attempts), 20)
+
+    def test_output_arriving_in_bursts_is_fully_captured(self):
+        script = [
+            (0.3, b"\x01\x00\x00\x00\x00\x00\x00\x02a\n"),
+            (0.5, b"\x02\x00\x00\x00\x00\x00\x00\x02b\n"),
+            (0.5, b"\x01\x00\x00\x00\x00\x00\x00\x02c\n"),
+        ]
+        with exec_stream(script, initial_timeout=0.2) as response:
+            output = dc.read_exec_output(response, timeout_seconds=10, output_limit_bytes=4096)
+
+        self.assertFalse(output.timed_out)
+        self.assertEqual(decode_exec_output(output.payload), ("a\nc", "b"))
+        self.assertLess(len(response.read_attempts), 20)
+
+    def test_overrunning_command_times_out_at_the_deadline(self):
+        with exec_stream([(30, b"never")], initial_timeout=0.2) as response:
+            started = time.monotonic()
+            output = dc.read_exec_output(response, timeout_seconds=1, output_limit_bytes=4096)
+            elapsed = time.monotonic() - started
+
+        self.assertTrue(output.timed_out)
+        self.assertEqual(output.payload, b"")
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 5)
+        # A single blocking read covers the whole deadline; no busy loop.
+        self.assertLess(len(response.read_attempts), 20)
+
+    def test_partial_output_is_kept_when_the_command_overruns(self):
+        script = [(0.2, b"\x01\x00\x00\x00\x00\x00\x00\x04part"), (30, b"never")]
+        with exec_stream(script, initial_timeout=0.2) as response:
+            output = dc.read_exec_output(response, timeout_seconds=1, output_limit_bytes=4096)
+
+        self.assertTrue(output.timed_out)
+        self.assertEqual(decode_exec_output(output.payload), ("part", ""))
+
+    def test_read_deadline_is_rearmed_on_the_response_socket(self):
+        with exec_stream([(0.1, b"data")], initial_timeout=5) as response:
+            arm_stream_read_timeout(response, 2.5)
+            self.assertEqual(response.docker_socket.gettimeout(), 2.5)
+
+    def test_arming_a_response_without_a_socket_is_a_no_op(self):
+        arm_stream_read_timeout(FakeResponse(body=b""), 1.0)
 
 
 class DockerHttpTests(unittest.TestCase):
@@ -441,6 +585,7 @@ class DockerHttpTests(unittest.TestCase):
             def __init__(self, socket_path, timeout):
                 self.socket_path = socket_path
                 self.timeout = timeout
+                self.sock = None
                 self.request_args = None
                 FakeConnection.instances.append(self)
 
@@ -481,6 +626,7 @@ class DockerHttpTests(unittest.TestCase):
             def __init__(self, socket_path, timeout):
                 self.socket_path = socket_path
                 self.timeout = timeout
+                self.sock = None
 
             def request(self, method, path, body=None, headers=None):
                 self.request_args = (method, path, body, headers)
@@ -500,6 +646,24 @@ class DockerHttpTests(unittest.TestCase):
 
         self.assertFalse(ok_response.closed)
         self.assertTrue(error_response.closed)
+
+    def test_request_attaches_the_live_socket_to_the_response(self):
+        sentinel_socket = object()
+
+        class FakeConnection:
+            def __init__(self, socket_path, timeout):
+                self.sock = sentinel_socket
+
+            def request(self, method, path, body=None, headers=None):
+                pass
+
+            def getresponse(self):
+                return FakeResponse(body=b"stream")
+
+        with mock.patch.object(dc, "UnixHTTPConnection", FakeConnection):
+            response = DockerClient("/sock").stream("POST", "/exec/x/start")
+
+        self.assertIs(response.docker_socket, sentinel_socket)
 
     def test_docker_client_wrappers(self):
         client = DockerClient()
@@ -535,7 +699,7 @@ class DockerHttpTests(unittest.TestCase):
             client.start_exec("exec/1", timeout_seconds=3, output_limit_bytes=10),
             ExecOutput(b"payload", truncated=False, timed_out=False),
         )
-        self.assertEqual(client.stream.call_args.kwargs["timeout"], 1.0)
+        self.assertNotIn("timeout", client.stream.call_args.kwargs)
         self.assertTrue(response.closed)
 
         client.request = mock.Mock(return_value={"ExitCode": 0})
@@ -620,7 +784,24 @@ class DockerCronTests(unittest.TestCase):
         self.assertNotIn("due", controller.last_run)
         self.assertEqual(controller.last_run["duplicate"], "2026-05-20T09:00:00+00:00")
 
-    def test_reserve_job_slot_blocks_overlap_and_concurrency(self):
+    def test_reserve_job_blocks_overlapping_runs_of_the_same_job(self):
+        controller = DockerCron(
+            docker=mock.Mock(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        first = make_job(key="first")
+        second = make_job(key="second")
+
+        self.assertTrue(controller._reserve_job(first))
+        with quiet_logs():
+            self.assertFalse(controller._reserve_job(first))
+        self.assertTrue(controller._reserve_job(second))
+        controller._release_job(first)
+        self.assertTrue(controller._reserve_job(first))
+
+    def test_acquire_execution_slot_waits_for_a_free_slot(self):
         controller = DockerCron(
             docker=mock.Mock(),
             timezone=dt.timezone.utc,
@@ -628,18 +809,58 @@ class DockerCronTests(unittest.TestCase):
             self_container_id=None,
             max_concurrent_jobs=1,
         )
-        first = make_job(key="first")
-        second = make_job(key="second")
+        job = make_job()
+        self.assertTrue(controller._acquire_execution_slot(job))
 
-        self.assertTrue(controller._reserve_job_slot(first))
+        # The slot frees up while the second caller is polling for it.
+        def release_after_first_poll(timeout):
+            controller.stop_event.waited.append(timeout)
+            controller.job_slots.release()
+            return False
+
+        controller.stop_event = RecordingEvent()
+        controller.stop_event.wait = release_after_first_poll
+
+        self.assertTrue(controller._acquire_execution_slot(job))
+        self.assertEqual(
+            controller.stop_event.waited,
+            [dc.JOB_SLOT_POLL_INTERVAL_SECONDS],
+        )
+
+    def test_acquire_execution_slot_gives_up_after_the_bounded_wait(self):
+        controller = DockerCron(
+            docker=mock.Mock(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+            max_concurrent_jobs=1,
+        )
+        job = make_job()
+        self.assertTrue(controller._acquire_execution_slot(job))
+
+        with mock.patch.object(
+            dc.time, "monotonic", side_effect=[0, dc.JOB_SLOT_WAIT_SECONDS + 1]
+        ), quiet_logs() as logs:
+            self.assertFalse(controller._acquire_execution_slot(job))
+
+        self.assertIn("max concurrent jobs is reached", logs.getvalue())
+
+    def test_acquire_execution_slot_gives_up_when_stopping(self):
+        controller = DockerCron(
+            docker=mock.Mock(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+            max_concurrent_jobs=1,
+        )
+        job = make_job()
+        self.assertTrue(controller._acquire_execution_slot(job))
+        controller.stop_event.set()
+
         with quiet_logs():
-            self.assertFalse(controller._reserve_job_slot(first))
-            self.assertFalse(controller._reserve_job_slot(second))
-        controller._release_job_slot(first)
-        self.assertTrue(controller._reserve_job_slot(second))
-        controller._release_job_slot(second)
+            self.assertFalse(controller._acquire_execution_slot(job))
 
-    def test_run_job_thread_releases_reserved_slot(self):
+    def test_run_job_thread_releases_job_key_and_execution_slot(self):
         docker = mock.Mock()
         docker.list_running_containers.return_value = []
         controller = DockerCron(
@@ -647,15 +868,82 @@ class DockerCronTests(unittest.TestCase):
             timezone=dt.timezone.utc,
             discovery_interval_seconds=60,
             self_container_id=None,
+            max_concurrent_jobs=1,
         )
         job = make_job()
-        self.assertTrue(controller._reserve_job_slot(job))
+        self.assertTrue(controller._reserve_job(job))
         controller._run_job = mock.Mock()
 
         controller._run_job_thread(job, "minute")
 
         self.assertEqual(controller.active_jobs, set())
         controller._run_job.assert_called_once_with(job, "minute")
+        # The semaphore is back to full capacity.
+        self.assertTrue(controller.job_slots.acquire(blocking=False))
+
+    def test_run_job_thread_does_not_hold_a_slot_while_jittering(self):
+        """A jittered job must not occupy an execution slot while it waits."""
+        controller = DockerCron(
+            docker=mock.Mock(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+            max_concurrent_jobs=1,
+        )
+        job = make_job(jitter_seconds=30)
+        slot_free_during_jitter = []
+
+        def observe_jitter_wait(timeout):
+            slot_free_during_jitter.append(controller.job_slots.acquire(blocking=False))
+            if slot_free_during_jitter[-1]:
+                controller.job_slots.release()
+            return False
+
+        controller.stop_event = RecordingEvent()
+        controller.stop_event.wait = observe_jitter_wait
+        controller._run_job = mock.Mock()
+        self.assertTrue(controller._reserve_job(job))
+
+        with mock.patch.object(dc.random, "randint", return_value=30), quiet_logs():
+            controller._run_job_thread(job, "minute")
+
+        self.assertEqual(slot_free_during_jitter, [True])
+        controller._run_job.assert_called_once_with(job, "minute")
+
+    def test_run_job_thread_skips_execution_when_stopped_during_jitter(self):
+        controller = DockerCron(
+            docker=mock.Mock(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        job = make_job(jitter_seconds=5)
+        controller.stop_event = RecordingEvent(wait_results=[True])
+        controller._run_job = mock.Mock()
+        self.assertTrue(controller._reserve_job(job))
+
+        with mock.patch.object(dc.random, "randint", return_value=5), quiet_logs():
+            controller._run_job_thread(job, "minute")
+
+        controller._run_job.assert_not_called()
+        self.assertEqual(controller.active_jobs, set())
+
+    def test_run_job_thread_releases_job_key_when_no_slot_is_available(self):
+        controller = DockerCron(
+            docker=mock.Mock(),
+            timezone=dt.timezone.utc,
+            discovery_interval_seconds=60,
+            self_container_id=None,
+        )
+        job = make_job()
+        controller._run_job = mock.Mock()
+        controller._acquire_execution_slot = mock.Mock(return_value=False)
+        self.assertTrue(controller._reserve_job(job))
+
+        controller._run_job_thread(job, "minute")
+
+        controller._run_job.assert_not_called()
+        self.assertEqual(controller.active_jobs, set())
 
     def test_run_starts_worker_threads_and_sets_stop_flags(self):
         class FakeThread:
@@ -823,7 +1111,8 @@ class DockerCronTests(unittest.TestCase):
         self.assertTrue(FakeThread.created[0].started)
         self.assertIn(job.key, controller.last_run)
 
-    def test_schedule_loop_skips_when_job_slot_is_unavailable(self):
+    def test_schedule_loop_skips_overlapping_job_without_retrying_the_minute(self):
+        """A job whose previous run is still active is skipped once, not every second."""
         controller = DockerCron(
             docker=mock.Mock(),
             timezone=dt.timezone.utc,
@@ -833,14 +1122,21 @@ class DockerCronTests(unittest.TestCase):
         job = make_job(name="tick")
         controller.jobs = {job.key: job}
         controller.stop_event = FakeLoopEvent()
-        controller._reserve_job_slot = mock.Mock(return_value=False)
+        controller._reserve_job = mock.Mock(return_value=False)
 
         with mock.patch.object(dc.threading, "Thread") as thread_class:
             controller._schedule_loop()
 
         thread_class.assert_not_called()
-        self.assertNotIn(job.key, controller.last_run)
-        self.assertEqual(controller.stop_event.waited, [1.0])
+        self.assertEqual(len(controller.stop_event.waited), 1)
+
+        # The occurrence is marked as handled, so the job is not reconsidered
+        # (and re-warned about) for the rest of the same minute.
+        minute_key = controller.last_run[job.key]
+        self.assertEqual(
+            controller._due_jobs(dt.datetime.now(dt.timezone.utc), minute_key),
+            [],
+        )
 
     def test_run_job_success_nonzero_stopped_and_error_paths(self):
         class FakeDocker:
@@ -869,8 +1165,8 @@ class DockerCronTests(unittest.TestCase):
             discovery_interval_seconds=60,
             self_container_id=None,
         )
-        with mock.patch.object(dc.random, "randint", return_value=0), quiet_logs():
-            success._run_job(make_job(jitter_seconds=1), "minute")
+        with quiet_logs():
+            success._run_job(make_job(), "minute")
 
         failed_exit = DockerCron(
             docker=FakeDocker(exit_code=2),
@@ -900,16 +1196,6 @@ class DockerCronTests(unittest.TestCase):
         with quiet_logs():
             errored._run_job(make_job(), "minute")
         self.assertTrue(errored.rescan_event.is_set())
-
-        interrupted = DockerCron(
-            docker=FakeDocker(),
-            timezone=dt.timezone.utc,
-            discovery_interval_seconds=60,
-            self_container_id=None,
-        )
-        interrupted.stop_event.set()
-        with mock.patch.object(dc.random, "randint", return_value=5), quiet_logs():
-            interrupted._run_job(make_job(jitter_seconds=5), "minute")
 
     def test_run_job_waits_for_timed_out_exec_in_calling_thread(self):
         class FakeDocker:
@@ -994,14 +1280,14 @@ class DockerCronTests(unittest.TestCase):
         )
         controller.stop_event = BlockingEvent()
         job = make_job()
-        self.assertTrue(controller._reserve_job_slot(job))
+        self.assertTrue(controller._reserve_job(job))
 
         with quiet_logs():
             thread = dc.threading.Thread(target=controller._run_job_thread, args=(job, "minute"))
             thread.start()
             self.assertTrue(controller.stop_event.entered_wait.wait(1))
             self.assertIn(job.key, controller.active_jobs)
-            self.assertFalse(controller._reserve_job_slot(job))
+            self.assertFalse(controller._reserve_job(job))
             controller.stop_event.release_wait.set()
             thread.join(1)
 

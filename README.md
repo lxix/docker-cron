@@ -3,8 +3,7 @@
 `docker-cron` runs cron-like jobs inside already running Docker containers based
 on container labels.
 
-The controller uses the Docker Engine API through `/var/run/docker.sock`. The
-runtime logic is a Python standard-library script.
+The controller uses the Docker Engine API through `/var/run/docker.sock`.
 
 ## Labels
 
@@ -89,14 +88,9 @@ docker build -t docker-cron:latest .
 
 ## Development
 
-Run the test suite with the project's coverage gate:
-
-```sh
-python3 tools/check_coverage.py
-```
-
-This uses only Python's standard library and enforces 100% line coverage for
-`docker_cron.py`.
+Conventions, the repository map and the test workflow are in
+[`CLAUDE.md`](CLAUDE.md). The reasoning behind the design is in
+[`docs/decisions.md`](docs/decisions.md).
 
 ## Behavior
 
@@ -106,7 +100,12 @@ This uses only Python's standard library and enforces 100% line coverage for
 - It also performs a full periodic rescan, controlled by
   `DISCOVERY_INTERVAL_SECONDS`.
 - Jobs do not overlap with a previous still-running execution of the same job.
-- The controller enforces a global `MAX_CONCURRENT_JOBS` limit.
+  Such an occurrence is skipped for that minute and reported once.
+- Jitter is waited out before an execution slot is taken, so a job that is only
+  waiting does not hold a slot away from other jobs.
+- The controller enforces a global `MAX_CONCURRENT_JOBS` limit on running execs.
+  A due job waits up to 60 seconds for a free slot and is skipped if none frees
+  up in that window.
 - A job that exceeds its timeout is logged as timed out. The controller keeps
   that job slot reserved until Docker reports that the exec process has
   finished, or the target container stops, so timed-out jobs do not pile up with

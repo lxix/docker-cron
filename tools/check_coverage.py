@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Run the unit tests and enforce 100% line coverage for docker_cron.py.
-
-This intentionally uses Python's stdlib trace module so the project keeps its
-runtime and test tooling dependency-free.
-"""
+"""Run the unit tests and enforce 100% line coverage for docker_cron.py."""
 
 from __future__ import annotations
 
